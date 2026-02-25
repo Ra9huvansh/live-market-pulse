@@ -67,6 +67,10 @@ double totalAggressiveSell = 0.0;
 double updateAggressiveBuy  = 0.0;
 double updateAggressiveSell = 0.0;
 
+// ===== IMBALANCE HISTORY =====
+const int IMBALANCE_HISTORY = 60;
+deque<double> imbalanceHistory;
+
 // ===== CSV LOGGING =====
 ofstream csvFile;
 long long updateCount = 0;
@@ -207,13 +211,64 @@ void logToCSV(double midPrice, double bestBid, double bestAsk,
     csvFile.flush();
 }
 
-// helper to print colored string at position
 void printAt(int row, int col, int colorPair, const string& s, bool bold = false) {
     if (bold) attron(A_BOLD);
     attron(COLOR_PAIR(colorPair));
     mvprintw(row, col, "%s", s.c_str());
     attroff(COLOR_PAIR(colorPair));
     if (bold) attroff(A_BOLD);
+}
+
+// ===== IMBALANCE GRAPH =====
+// Graph is 8 rows tall, IMBALANCE_HISTORY cols wide
+// Row 0 = imbalance 1.0 (top), Row 7 = imbalance 0.0 (bottom)
+// Each column is one historical value
+// A dot is placed at the row corresponding to that imbalance value
+// Color: green if >0.6, red if <0.4, yellow otherwise
+void drawImbalanceGraph(int startRow) {
+    const int GRAPH_HEIGHT = 8;
+    const int GRAPH_WIDTH  = IMBALANCE_HISTORY;
+
+    printAt(startRow, 0, COL_HEADER, "--------- IMBALANCE HISTORY (last 60 updates) ---------");
+    startRow++;
+
+    // Y-axis labels and graph rows
+    for (int r = 0; r < GRAPH_HEIGHT; r++) {
+        // imbalance value this row represents (top=1.0, bottom=0.0)
+        double rowVal = 1.0 - (double)r / (GRAPH_HEIGHT - 1);
+
+        char label[8];
+        snprintf(label, sizeof(label), "%.1f |", rowVal);
+        printAt(startRow + r, 0, COL_NEUTRAL, string(label));
+
+        // draw each column
+        int col = 6;
+        for (int i = 0; i < (int)imbalanceHistory.size(); i++) {
+            double val = imbalanceHistory[i];
+
+            // which row does this value map to?
+            int valRow = (int)round((1.0 - val) * (GRAPH_HEIGHT - 1));
+
+            if (valRow == r) {
+                // pick color
+                int color;
+                if      (val > 0.6) color = COL_BID;
+                else if (val < 0.4) color = COL_ASK;
+                else                color = COL_SPREAD;
+
+                printAt(startRow + r, col + i, color, "*", true);
+            } else {
+                printAt(startRow + r, col + i, COL_NEUTRAL, " ");
+            }
+        }
+    }
+
+    // X-axis
+    string xaxis = "     +";
+    for (int i = 0; i < GRAPH_WIDTH; i++) xaxis += "-";
+    printAt(startRow + GRAPH_HEIGHT, 0, COL_NEUTRAL, xaxis);
+    printAt(startRow + GRAPH_HEIGHT + 1, 0, COL_NEUTRAL,
+            "      <-- older                                     newer -->");
 }
 
 void drawUI(double midPrice, double bestBid, double bestAsk,
@@ -225,14 +280,13 @@ void drawUI(double midPrice, double bestBid, double bestAsk,
             pair<double,double> nearestAskWall,
             pair<double,double> nearestBidWall) {
 
-    erase();  // clear screen without flicker
+    erase();
 
     int row = 0;
+    char buf[256];
 
     // ===== HEADER =====
     printAt(row++, 0, COL_HEADER, "=============== PULSE ===============", true);
-
-    char buf[128];
     snprintf(buf, sizeof(buf), "Price: $%.2f   Spread: $%.2f   Latency: %.0f ns   Rows: %lld",
              midPrice, spread, latencyNs, updateCount);
     printAt(row++, 0, COL_NEUTRAL, string(buf));
@@ -242,16 +296,12 @@ void drawUI(double midPrice, double bestBid, double bestAsk,
 
     // ===== ORDER BOOK =====
     printAt(row++, 0, COL_HEADER, "--------- ORDER BOOK ---------");
-
-    // asks in reverse so lowest is closest to spread
     for (auto it = topAsks.rbegin(); it != topAsks.rend(); ++it) {
         snprintf(buf, sizeof(buf), "  $%.2f  |  %.4f BTC  <-- SELL", it->first, it->second);
         printAt(row++, 0, COL_ASK, string(buf));
     }
-
     snprintf(buf, sizeof(buf), "  ------- SPREAD: $%.2f -------", spread);
     printAt(row++, 0, COL_SPREAD, string(buf));
-
     for (auto& b : topBids) {
         snprintf(buf, sizeof(buf), "  $%.2f  |  %.4f BTC  <-- BUY ", b.first, b.second);
         printAt(row++, 0, COL_BID, string(buf));
@@ -260,7 +310,6 @@ void drawUI(double midPrice, double bestBid, double bestAsk,
 
     // ===== IMBALANCE =====
     printAt(row++, 0, COL_HEADER, "--------- IMBALANCE ----------");
-
     string imbalanceStr;
     int imbalanceColor;
     if (imbalance > 0.6) {
@@ -273,46 +322,39 @@ void drawUI(double midPrice, double bestBid, double bestAsk,
         imbalanceStr = "      NEUTRAL      ";
         imbalanceColor = COL_NEUTRAL;
     }
-
     snprintf(buf, sizeof(buf), "  Imbalance: %.4f  %s", imbalance, imbalanceStr.c_str());
     printAt(row++, 0, imbalanceColor, string(buf), true);
     row++;
 
     // ===== TOXICITY =====
     printAt(row++, 0, COL_HEADER, "--------- FLOW TOXICITY ------");
-
     snprintf(buf, sizeof(buf), "  Buy  aggression: %.4f BTC", buyAggression);
     printAt(row++, 0, COL_BID, string(buf));
-
     snprintf(buf, sizeof(buf), "  Sell aggression: %.4f BTC", sellAggression);
     printAt(row++, 0, COL_ASK, string(buf));
-
     string toxStr;
     int toxColor;
-    if      (aggressionRatio > 0.65) { toxStr = "AGGRESSIVE BUYERS";   toxColor = COL_BID; }
-    else if (aggressionRatio < 0.35) { toxStr = "AGGRESSIVE SELLERS";  toxColor = COL_ASK; }
-    else                              { toxStr = "MIXED AGGRESSION";    toxColor = COL_NEUTRAL; }
-
+    if      (aggressionRatio > 0.65) { toxStr = "AGGRESSIVE BUYERS";  toxColor = COL_BID; }
+    else if (aggressionRatio < 0.35) { toxStr = "AGGRESSIVE SELLERS"; toxColor = COL_ASK; }
+    else                              { toxStr = "MIXED AGGRESSION";   toxColor = COL_NEUTRAL; }
     snprintf(buf, sizeof(buf), "  Ratio: %.4f  %s", aggressionRatio, toxStr.c_str());
     printAt(row++, 0, toxColor, string(buf), true);
     row++;
 
     // ===== NEAREST WALLS =====
     printAt(row++, 0, COL_HEADER, "--------- NEAREST WALLS ------");
-
     if (nearestAskWall.first > 0) {
-        double dist = nearestAskWall.first - midPrice;
         snprintf(buf, sizeof(buf), "  ASK WALL  $%.2f  |  %.2f BTC  ($%.2f away)",
-                 nearestAskWall.first, nearestAskWall.second, dist);
+                 nearestAskWall.first, nearestAskWall.second,
+                 nearestAskWall.first - midPrice);
         printAt(row++, 0, COL_ASK, string(buf));
     } else {
         printAt(row++, 0, COL_NEUTRAL, "  ASK WALL  none nearby");
     }
-
     if (nearestBidWall.first > 0) {
-        double dist = midPrice - nearestBidWall.first;
         snprintf(buf, sizeof(buf), "  BID WALL  $%.2f  |  %.2f BTC  ($%.2f away)",
-                 nearestBidWall.first, nearestBidWall.second, dist);
+                 nearestBidWall.first, nearestBidWall.second,
+                 midPrice - nearestBidWall.first);
         printAt(row++, 0, COL_BID, string(buf));
     } else {
         printAt(row++, 0, COL_NEUTRAL, "  BID WALL  none nearby");
@@ -321,19 +363,18 @@ void drawUI(double midPrice, double bestBid, double bestAsk,
 
     // ===== ALERTS =====
     printAt(row++, 0, COL_HEADER, "--------- LAST ALERTS --------");
-
     if (recentWallEvents.empty()) {
         printAt(row++, 0, COL_NEUTRAL, "  none yet");
     } else {
-        for (auto& e : recentWallEvents) {
+        for (auto& e : recentWallEvents)
             printAt(row++, 0, COL_ALERT, "  " + e, true);
-        }
     }
-
     row++;
-    printAt(row++, 0, COL_HEADER, "=====================================");
 
-    refresh();  // push to screen
+    // ===== IMBALANCE GRAPH =====
+    drawImbalanceGraph(row);
+
+    refresh();
 }
 
 void renderOrderBook(double latencyNs, int numUpdates) {
@@ -361,6 +402,11 @@ void renderOrderBook(double latencyNs, int numUpdates) {
     for (auto& a : topAsks) askVolume += a.second;
     double imbalance = (bidVolume + askVolume > 0)
                        ? bidVolume / (bidVolume + askVolume) : 0.5;
+
+    // update imbalance history
+    imbalanceHistory.push_back(imbalance);
+    if ((int)imbalanceHistory.size() > IMBALANCE_HISTORY)
+        imbalanceHistory.pop_front();
 
     double totalAggressive = totalAggressiveBuy + totalAggressiveSell;
     double buyAggression   = totalAggressiveBuy;
