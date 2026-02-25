@@ -7,6 +7,7 @@
 #include <thread>
 #include <unordered_map>
 #include <chrono>
+#include <signal.h>
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket.hpp>
 #include <boost/beast/ssl.hpp>
@@ -72,6 +73,23 @@ deque<double> latencyHistory;
 ofstream csvFile;
 long long updateCount = 0;
 
+// ===== RESET STATE ON RECONNECT =====
+void resetState() {
+    fill(bidLadder.begin(), bidLadder.end(), 0.0);
+    fill(askLadder.begin(), askLadder.end(), 0.0);
+    bestBidIdx = 0;
+    bestAskIdx = LADDER_SIZE - 1;
+    bidWalls.clear();
+    askWalls.clear();
+    recentWallEvents.clear();
+    aggressiveBuyVol.clear();
+    aggressiveSellVol.clear();
+    totalAggressiveBuy  = 0.0;
+    totalAggressiveSell = 0.0;
+    updateAggressiveBuy  = 0.0;
+    updateAggressiveSell = 0.0;
+}
+
 void initCSV() {
     csvFile.open("pulse_data.csv");
     csvFile << "timestamp_ms,update_count,mid_price,best_bid,best_ask,"
@@ -89,6 +107,14 @@ void initNcurses() {
     noecho();
     curs_set(0);
     keypad(stdscr, TRUE);
+
+    // handle terminal resize gracefully
+    signal(SIGWINCH, [](int) {
+        endwin();
+        refresh();
+        clear();
+    });
+
     init_pair(COL_HEADER,  COLOR_CYAN,    COLOR_BLACK);
     init_pair(COL_ASK,     COLOR_RED,     COLOR_BLACK);
     init_pair(COL_BID,     COLOR_GREEN,   COLOR_BLACK);
@@ -400,7 +426,6 @@ void drawUI(double midPrice, double bestBid, double bestAsk,
 void renderOrderBook(double latencyNs, int numUpdates) {
     updateCount++;
 
-    // ===== FIX: correct stale best indices before scanning =====
     while (bestBidIdx > 0 && bidLadder[bestBidIdx] == 0.0) bestBidIdx--;
     while (bestAskIdx < LADDER_SIZE - 1 && askLadder[bestAskIdx] == 0.0) bestAskIdx++;
 
@@ -532,6 +557,7 @@ int main() {
         }
         catch (exception const& e) {
             endwin();
+            resetState();
             cerr << "Disconnected: " << e.what() << endl;
             cerr << "Reconnecting in 2 seconds..." << endl;
             this_thread::sleep_for(chrono::seconds(2));
