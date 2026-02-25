@@ -31,7 +31,6 @@ namespace net = boost::asio;
 namespace ssl = boost::asio::ssl;
 using tcp = net::ip::tcp;
 
-// ===== COLOR PAIRS =====
 #define COL_HEADER  1
 #define COL_ASK     2
 #define COL_BID     3
@@ -40,7 +39,6 @@ using tcp = net::ip::tcp;
 #define COL_NEUTRAL 6
 #define COL_WALL    7
 
-// ===== PRICE LADDER =====
 const double BASE_PRICE     = 44000.0;
 const double TICK_SIZE      = 0.01;
 const int    LADDER_SIZE    = 5000000;
@@ -55,10 +53,8 @@ int bestAskIdx = LADDER_SIZE - 1;
 
 unordered_map<int, double> bidWalls;
 unordered_map<int, double> askWalls;
-
 vector<string> recentWallEvents;
 
-// ===== TOXICITY TRACKING =====
 const int TOXICITY_WINDOW = 100;
 deque<double> aggressiveBuyVol;
 deque<double> aggressiveSellVol;
@@ -67,11 +63,12 @@ double totalAggressiveSell = 0.0;
 double updateAggressiveBuy  = 0.0;
 double updateAggressiveSell = 0.0;
 
-// ===== IMBALANCE HISTORY =====
 const int IMBALANCE_HISTORY = 60;
 deque<double> imbalanceHistory;
 
-// ===== CSV LOGGING =====
+const int LATENCY_HISTORY = 60;
+deque<double> latencyHistory;
+
 ofstream csvFile;
 long long updateCount = 0;
 
@@ -92,7 +89,6 @@ void initNcurses() {
     noecho();
     curs_set(0);
     keypad(stdscr, TRUE);
-
     init_pair(COL_HEADER,  COLOR_CYAN,    COLOR_BLACK);
     init_pair(COL_ASK,     COLOR_RED,     COLOR_BLACK);
     init_pair(COL_BID,     COLOR_GREEN,   COLOR_BLACK);
@@ -219,12 +215,6 @@ void printAt(int row, int col, int colorPair, const string& s, bool bold = false
     if (bold) attroff(A_BOLD);
 }
 
-// ===== IMBALANCE GRAPH =====
-// Graph is 8 rows tall, IMBALANCE_HISTORY cols wide
-// Row 0 = imbalance 1.0 (top), Row 7 = imbalance 0.0 (bottom)
-// Each column is one historical value
-// A dot is placed at the row corresponding to that imbalance value
-// Color: green if >0.6, red if <0.4, yellow otherwise
 void drawImbalanceGraph(int startRow) {
     const int GRAPH_HEIGHT = 8;
     const int GRAPH_WIDTH  = IMBALANCE_HISTORY;
@@ -232,30 +222,18 @@ void drawImbalanceGraph(int startRow) {
     printAt(startRow, 0, COL_HEADER, "--------- IMBALANCE HISTORY (last 60 updates) ---------");
     startRow++;
 
-    // Y-axis labels and graph rows
     for (int r = 0; r < GRAPH_HEIGHT; r++) {
-        // imbalance value this row represents (top=1.0, bottom=0.0)
         double rowVal = 1.0 - (double)r / (GRAPH_HEIGHT - 1);
-
         char label[8];
         snprintf(label, sizeof(label), "%.1f |", rowVal);
         printAt(startRow + r, 0, COL_NEUTRAL, string(label));
 
-        // draw each column
         int col = 6;
         for (int i = 0; i < (int)imbalanceHistory.size(); i++) {
             double val = imbalanceHistory[i];
-
-            // which row does this value map to?
             int valRow = (int)round((1.0 - val) * (GRAPH_HEIGHT - 1));
-
             if (valRow == r) {
-                // pick color
-                int color;
-                if      (val > 0.6) color = COL_BID;
-                else if (val < 0.4) color = COL_ASK;
-                else                color = COL_SPREAD;
-
+                int color = (val > 0.6) ? COL_BID : (val < 0.4) ? COL_ASK : COL_SPREAD;
                 printAt(startRow + r, col + i, color, "*", true);
             } else {
                 printAt(startRow + r, col + i, COL_NEUTRAL, " ");
@@ -263,10 +241,58 @@ void drawImbalanceGraph(int startRow) {
         }
     }
 
-    // X-axis
     string xaxis = "     +";
     for (int i = 0; i < GRAPH_WIDTH; i++) xaxis += "-";
-    printAt(startRow + GRAPH_HEIGHT, 0, COL_NEUTRAL, xaxis);
+    printAt(startRow + GRAPH_HEIGHT,     0, COL_NEUTRAL, xaxis);
+    printAt(startRow + GRAPH_HEIGHT + 1, 0, COL_NEUTRAL,
+            "      <-- older                                     newer -->");
+}
+
+void drawLatencyGraph(int startRow) {
+    const int GRAPH_HEIGHT = 6;
+    const int GRAPH_WIDTH  = LATENCY_HISTORY;
+
+    printAt(startRow, 0, COL_HEADER, "--------- LATENCY HISTORY (last 60 updates) -----------");
+    startRow++;
+
+    if (latencyHistory.empty()) {
+        printAt(startRow, 0, COL_NEUTRAL, "  waiting for data...");
+        return;
+    }
+
+    double maxLat = *max_element(latencyHistory.begin(), latencyHistory.end());
+    maxLat = max(maxLat, 100000.0);
+    double scale = ceil(maxLat / 100000.0) * 100000.0;
+
+    for (int r = 0; r < GRAPH_HEIGHT; r++) {
+        double rowVal = scale * (1.0 - (double)r / (GRAPH_HEIGHT - 1));
+        char label[10];
+        if (rowVal >= 1000000.0)
+            snprintf(label, sizeof(label), "%.0fm|", rowVal / 1000000.0);
+        else
+            snprintf(label, sizeof(label), "%.0fk|", rowVal / 1000.0);
+        printAt(startRow + r, 0, COL_NEUTRAL, string(label));
+
+        int col = 6;
+        for (int i = 0; i < (int)latencyHistory.size(); i++) {
+            double val = latencyHistory[i];
+            int valRow = (int)round((1.0 - val / scale) * (GRAPH_HEIGHT - 1));
+            valRow = max(0, min(GRAPH_HEIGHT - 1, valRow));
+            if (valRow == r) {
+                int color;
+                if      (val < 200000.0) color = COL_BID;
+                else if (val < 500000.0) color = COL_SPREAD;
+                else                     color = COL_ASK;
+                printAt(startRow + r, col + i, color, "*", true);
+            } else {
+                printAt(startRow + r, col + i, COL_NEUTRAL, " ");
+            }
+        }
+    }
+
+    string xaxis = "     +";
+    for (int i = 0; i < GRAPH_WIDTH; i++) xaxis += "-";
+    printAt(startRow + GRAPH_HEIGHT,     0, COL_NEUTRAL, xaxis);
     printAt(startRow + GRAPH_HEIGHT + 1, 0, COL_NEUTRAL,
             "      <-- older                                     newer -->");
 }
@@ -281,11 +307,9 @@ void drawUI(double midPrice, double bestBid, double bestAsk,
             pair<double,double> nearestBidWall) {
 
     erase();
-
     int row = 0;
     char buf[256];
 
-    // ===== HEADER =====
     printAt(row++, 0, COL_HEADER, "=============== PULSE ===============", true);
     snprintf(buf, sizeof(buf), "Price: $%.2f   Spread: $%.2f   Latency: %.0f ns   Rows: %lld",
              midPrice, spread, latencyNs, updateCount);
@@ -294,7 +318,6 @@ void drawUI(double midPrice, double bestBid, double bestAsk,
     printAt(row++, 0, COL_NEUTRAL, string(buf));
     row++;
 
-    // ===== ORDER BOOK =====
     printAt(row++, 0, COL_HEADER, "--------- ORDER BOOK ---------");
     for (auto it = topAsks.rbegin(); it != topAsks.rend(); ++it) {
         snprintf(buf, sizeof(buf), "  $%.2f  |  %.4f BTC  <-- SELL", it->first, it->second);
@@ -308,7 +331,6 @@ void drawUI(double midPrice, double bestBid, double bestAsk,
     }
     row++;
 
-    // ===== IMBALANCE =====
     printAt(row++, 0, COL_HEADER, "--------- IMBALANCE ----------");
     string imbalanceStr;
     int imbalanceColor;
@@ -326,7 +348,6 @@ void drawUI(double midPrice, double bestBid, double bestAsk,
     printAt(row++, 0, imbalanceColor, string(buf), true);
     row++;
 
-    // ===== TOXICITY =====
     printAt(row++, 0, COL_HEADER, "--------- FLOW TOXICITY ------");
     snprintf(buf, sizeof(buf), "  Buy  aggression: %.4f BTC", buyAggression);
     printAt(row++, 0, COL_BID, string(buf));
@@ -341,7 +362,6 @@ void drawUI(double midPrice, double bestBid, double bestAsk,
     printAt(row++, 0, toxColor, string(buf), true);
     row++;
 
-    // ===== NEAREST WALLS =====
     printAt(row++, 0, COL_HEADER, "--------- NEAREST WALLS ------");
     if (nearestAskWall.first > 0) {
         snprintf(buf, sizeof(buf), "  ASK WALL  $%.2f  |  %.2f BTC  ($%.2f away)",
@@ -361,7 +381,6 @@ void drawUI(double midPrice, double bestBid, double bestAsk,
     }
     row++;
 
-    // ===== ALERTS =====
     printAt(row++, 0, COL_HEADER, "--------- LAST ALERTS --------");
     if (recentWallEvents.empty()) {
         printAt(row++, 0, COL_NEUTRAL, "  none yet");
@@ -371,14 +390,19 @@ void drawUI(double midPrice, double bestBid, double bestAsk,
     }
     row++;
 
-    // ===== IMBALANCE GRAPH =====
     drawImbalanceGraph(row);
+    row += 12;
+    drawLatencyGraph(row);
 
     refresh();
 }
 
 void renderOrderBook(double latencyNs, int numUpdates) {
     updateCount++;
+
+    // ===== FIX: correct stale best indices before scanning =====
+    while (bestBidIdx > 0 && bidLadder[bestBidIdx] == 0.0) bestBidIdx--;
+    while (bestAskIdx < LADDER_SIZE - 1 && askLadder[bestAskIdx] == 0.0) bestAskIdx++;
 
     vector<pair<double,double>> topAsks;
     for (int i = bestAskIdx; i < LADDER_SIZE && topAsks.size() < 5; ++i) {
@@ -403,10 +427,13 @@ void renderOrderBook(double latencyNs, int numUpdates) {
     double imbalance = (bidVolume + askVolume > 0)
                        ? bidVolume / (bidVolume + askVolume) : 0.5;
 
-    // update imbalance history
     imbalanceHistory.push_back(imbalance);
     if ((int)imbalanceHistory.size() > IMBALANCE_HISTORY)
         imbalanceHistory.pop_front();
+
+    latencyHistory.push_back(latencyNs);
+    if ((int)latencyHistory.size() > LATENCY_HISTORY)
+        latencyHistory.pop_front();
 
     double totalAggressive = totalAggressiveBuy + totalAggressiveSell;
     double buyAggression   = totalAggressiveBuy;
