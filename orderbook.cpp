@@ -14,6 +14,13 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ssl.hpp>
 #include <nlohmann/json.hpp>
+#ifdef timeout
+#undef timeout
+#endif
+#include <ncurses.h>
+#ifdef timeout
+#undef timeout
+#endif
 
 using namespace std;
 using json = nlohmann::json;
@@ -23,6 +30,15 @@ namespace websocket = beast::websocket;
 namespace net = boost::asio;
 namespace ssl = boost::asio::ssl;
 using tcp = net::ip::tcp;
+
+// ===== COLOR PAIRS =====
+#define COL_HEADER  1
+#define COL_ASK     2
+#define COL_BID     3
+#define COL_SPREAD  4
+#define COL_ALERT   5
+#define COL_NEUTRAL 6
+#define COL_WALL    7
 
 // ===== PRICE LADDER =====
 const double BASE_PRICE     = 44000.0;
@@ -57,25 +73,29 @@ long long updateCount = 0;
 
 void initCSV() {
     csvFile.open("pulse_data.csv");
-    csvFile << "timestamp_ms,"
-            << "update_count,"
-            << "mid_price,"
-            << "best_bid,"
-            << "best_ask,"
-            << "spread,"
-            << "latency_ns,"
-            << "num_updates,"
-            << "imbalance,"
-            << "buy_aggression,"
-            << "sell_aggression,"
-            << "aggression_ratio,"
-            << "nearest_ask_wall_price,"
-            << "nearest_ask_wall_qty,"
-            << "nearest_bid_wall_price,"
-            << "nearest_bid_wall_qty,"
-            << "wall_event"
-            << "\n";
+    csvFile << "timestamp_ms,update_count,mid_price,best_bid,best_ask,"
+            << "spread,latency_ns,num_updates,imbalance,buy_aggression,"
+            << "sell_aggression,aggression_ratio,nearest_ask_wall_price,"
+            << "nearest_ask_wall_qty,nearest_bid_wall_price,"
+            << "nearest_bid_wall_qty,wall_event\n";
     csvFile.flush();
+}
+
+void initNcurses() {
+    initscr();
+    start_color();
+    cbreak();
+    noecho();
+    curs_set(0);
+    keypad(stdscr, TRUE);
+
+    init_pair(COL_HEADER,  COLOR_CYAN,    COLOR_BLACK);
+    init_pair(COL_ASK,     COLOR_RED,     COLOR_BLACK);
+    init_pair(COL_BID,     COLOR_GREEN,   COLOR_BLACK);
+    init_pair(COL_SPREAD,  COLOR_YELLOW,  COLOR_BLACK);
+    init_pair(COL_ALERT,   COLOR_MAGENTA, COLOR_BLACK);
+    init_pair(COL_NEUTRAL, COLOR_WHITE,   COLOR_BLACK);
+    init_pair(COL_WALL,    COLOR_YELLOW,  COLOR_BLACK);
 }
 
 inline int priceToIndex(double price) {
@@ -161,18 +181,14 @@ void logToCSV(double midPrice, double bestBid, double bestAsk,
               double nearestAskWallPrice, double nearestAskWallQty,
               double nearestBidWallPrice, double nearestBidWallQty) {
 
-    // Timestamp in milliseconds since epoch
     auto now = chrono::system_clock::now();
     long long ms = chrono::duration_cast<chrono::milliseconds>(
         now.time_since_epoch()).count();
 
-    // Latest wall event if any
     string wallEvent = recentWallEvents.empty() ? "" : recentWallEvents.back();
-    // Escape commas in wall event
     for (auto& c : wallEvent) if (c == ',') c = ';';
 
-    csvFile << ms << ","
-            << updateCount << ","
+    csvFile << ms << "," << updateCount << ","
             << fixed << setprecision(2) << midPrice << ","
             << fixed << setprecision(2) << bestBid  << ","
             << fixed << setprecision(2) << bestAsk  << ","
@@ -187,13 +203,140 @@ void logToCSV(double midPrice, double bestBid, double bestAsk,
             << fixed << setprecision(2) << nearestAskWallQty   << ","
             << fixed << setprecision(2) << nearestBidWallPrice << ","
             << fixed << setprecision(2) << nearestBidWallQty   << ","
-            << wallEvent
-            << "\n";
+            << wallEvent << "\n";
     csvFile.flush();
 }
 
-void printOrderBook(double latencyNs, int numUpdates) {
-    system("clear");
+// helper to print colored string at position
+void printAt(int row, int col, int colorPair, const string& s, bool bold = false) {
+    if (bold) attron(A_BOLD);
+    attron(COLOR_PAIR(colorPair));
+    mvprintw(row, col, "%s", s.c_str());
+    attroff(COLOR_PAIR(colorPair));
+    if (bold) attroff(A_BOLD);
+}
+
+void drawUI(double midPrice, double bestBid, double bestAsk,
+            double spread, double latencyNs, int numUpdates,
+            double imbalance, double buyAggression, double sellAggression,
+            double aggressionRatio,
+            vector<pair<double,double>>& topAsks,
+            vector<pair<double,double>>& topBids,
+            pair<double,double> nearestAskWall,
+            pair<double,double> nearestBidWall) {
+
+    erase();  // clear screen without flicker
+
+    int row = 0;
+
+    // ===== HEADER =====
+    printAt(row++, 0, COL_HEADER, "=============== PULSE ===============", true);
+
+    char buf[128];
+    snprintf(buf, sizeof(buf), "Price: $%.2f   Spread: $%.2f   Latency: %.0f ns   Rows: %lld",
+             midPrice, spread, latencyNs, updateCount);
+    printAt(row++, 0, COL_NEUTRAL, string(buf));
+    snprintf(buf, sizeof(buf), "Updates: %d", numUpdates);
+    printAt(row++, 0, COL_NEUTRAL, string(buf));
+    row++;
+
+    // ===== ORDER BOOK =====
+    printAt(row++, 0, COL_HEADER, "--------- ORDER BOOK ---------");
+
+    // asks in reverse so lowest is closest to spread
+    for (auto it = topAsks.rbegin(); it != topAsks.rend(); ++it) {
+        snprintf(buf, sizeof(buf), "  $%.2f  |  %.4f BTC  <-- SELL", it->first, it->second);
+        printAt(row++, 0, COL_ASK, string(buf));
+    }
+
+    snprintf(buf, sizeof(buf), "  ------- SPREAD: $%.2f -------", spread);
+    printAt(row++, 0, COL_SPREAD, string(buf));
+
+    for (auto& b : topBids) {
+        snprintf(buf, sizeof(buf), "  $%.2f  |  %.4f BTC  <-- BUY ", b.first, b.second);
+        printAt(row++, 0, COL_BID, string(buf));
+    }
+    row++;
+
+    // ===== IMBALANCE =====
+    printAt(row++, 0, COL_HEADER, "--------- IMBALANCE ----------");
+
+    string imbalanceStr;
+    int imbalanceColor;
+    if (imbalance > 0.6) {
+        imbalanceStr = "BUY PRESSURE  >>>>";
+        imbalanceColor = COL_BID;
+    } else if (imbalance < 0.4) {
+        imbalanceStr = "<<<< SELL PRESSURE";
+        imbalanceColor = COL_ASK;
+    } else {
+        imbalanceStr = "      NEUTRAL      ";
+        imbalanceColor = COL_NEUTRAL;
+    }
+
+    snprintf(buf, sizeof(buf), "  Imbalance: %.4f  %s", imbalance, imbalanceStr.c_str());
+    printAt(row++, 0, imbalanceColor, string(buf), true);
+    row++;
+
+    // ===== TOXICITY =====
+    printAt(row++, 0, COL_HEADER, "--------- FLOW TOXICITY ------");
+
+    snprintf(buf, sizeof(buf), "  Buy  aggression: %.4f BTC", buyAggression);
+    printAt(row++, 0, COL_BID, string(buf));
+
+    snprintf(buf, sizeof(buf), "  Sell aggression: %.4f BTC", sellAggression);
+    printAt(row++, 0, COL_ASK, string(buf));
+
+    string toxStr;
+    int toxColor;
+    if      (aggressionRatio > 0.65) { toxStr = "AGGRESSIVE BUYERS";   toxColor = COL_BID; }
+    else if (aggressionRatio < 0.35) { toxStr = "AGGRESSIVE SELLERS";  toxColor = COL_ASK; }
+    else                              { toxStr = "MIXED AGGRESSION";    toxColor = COL_NEUTRAL; }
+
+    snprintf(buf, sizeof(buf), "  Ratio: %.4f  %s", aggressionRatio, toxStr.c_str());
+    printAt(row++, 0, toxColor, string(buf), true);
+    row++;
+
+    // ===== NEAREST WALLS =====
+    printAt(row++, 0, COL_HEADER, "--------- NEAREST WALLS ------");
+
+    if (nearestAskWall.first > 0) {
+        double dist = nearestAskWall.first - midPrice;
+        snprintf(buf, sizeof(buf), "  ASK WALL  $%.2f  |  %.2f BTC  ($%.2f away)",
+                 nearestAskWall.first, nearestAskWall.second, dist);
+        printAt(row++, 0, COL_ASK, string(buf));
+    } else {
+        printAt(row++, 0, COL_NEUTRAL, "  ASK WALL  none nearby");
+    }
+
+    if (nearestBidWall.first > 0) {
+        double dist = midPrice - nearestBidWall.first;
+        snprintf(buf, sizeof(buf), "  BID WALL  $%.2f  |  %.2f BTC  ($%.2f away)",
+                 nearestBidWall.first, nearestBidWall.second, dist);
+        printAt(row++, 0, COL_BID, string(buf));
+    } else {
+        printAt(row++, 0, COL_NEUTRAL, "  BID WALL  none nearby");
+    }
+    row++;
+
+    // ===== ALERTS =====
+    printAt(row++, 0, COL_HEADER, "--------- LAST ALERTS --------");
+
+    if (recentWallEvents.empty()) {
+        printAt(row++, 0, COL_NEUTRAL, "  none yet");
+    } else {
+        for (auto& e : recentWallEvents) {
+            printAt(row++, 0, COL_ALERT, "  " + e, true);
+        }
+    }
+
+    row++;
+    printAt(row++, 0, COL_HEADER, "=====================================");
+
+    refresh();  // push to screen
+}
+
+void renderOrderBook(double latencyNs, int numUpdates) {
     updateCount++;
 
     vector<pair<double,double>> topAsks;
@@ -219,21 +362,11 @@ void printOrderBook(double latencyNs, int numUpdates) {
     double imbalance = (bidVolume + askVolume > 0)
                        ? bidVolume / (bidVolume + askVolume) : 0.5;
 
-    string imbalanceStr;
-    if      (imbalance > 0.6) imbalanceStr = "BUY PRESSURE  >>>>";
-    else if (imbalance < 0.4) imbalanceStr = "<<<< SELL PRESSURE";
-    else                       imbalanceStr = "      NEUTRAL      ";
-
     double totalAggressive = totalAggressiveBuy + totalAggressiveSell;
     double buyAggression   = totalAggressiveBuy;
     double sellAggression  = totalAggressiveSell;
     double aggressionRatio = (totalAggressive > 0)
                              ? buyAggression / totalAggressive : 0.5;
-
-    string toxicityStr;
-    if      (aggressionRatio > 0.65) toxicityStr = "AGGRESSIVE BUYERS";
-    else if (aggressionRatio < 0.35) toxicityStr = "AGGRESSIVE SELLERS";
-    else                              toxicityStr = "MIXED AGGRESSION";
 
     pair<double,double> nearestBidWall = {0, 0};
     pair<double,double> nearestAskWall = {0, 0};
@@ -253,77 +386,24 @@ void printOrderBook(double latencyNs, int numUpdates) {
         }
     }
 
-    // Log to CSV
     logToCSV(midPrice, bestBid, bestAsk, spread, latencyNs, numUpdates,
              imbalance, buyAggression, sellAggression, aggressionRatio,
              nearestAskWall.first, nearestAskWall.second,
              nearestBidWall.first, nearestBidWall.second);
 
-    // ===== DISPLAY =====
-    cout << "============= PULSE =============" << endl;
-    cout << "Price:    $" << fixed << setprecision(2) << midPrice << endl;
-    cout << "Spread:   $" << fixed << setprecision(2) << spread   << endl;
-    cout << "Latency:   " << fixed << setprecision(0) << latencyNs << " ns" << endl;
-    cout << "Updates:   " << numUpdates << endl;
-    cout << "Logged:    " << updateCount << " rows -> pulse_data.csv" << endl;
-
-    cout << "\n";
-    for (auto it = topAsks.rbegin(); it != topAsks.rend(); ++it) {
-        cout << "  $" << fixed << setprecision(2) << it->first
-             << "  |  " << fixed << setprecision(4) << it->second
-             << " BTC  <-- SELL" << endl;
-    }
-    cout << "  --------- SPREAD: $" << fixed << setprecision(2) << spread << " ---------" << endl;
-    for (auto& b : topBids) {
-        cout << "  $" << fixed << setprecision(2) << b.first
-             << "  |  " << fixed << setprecision(4) << b.second
-             << " BTC  <-- BUY" << endl;
-    }
-
-    cout << "\nImbalance: " << fixed << setprecision(4) << imbalance
-         << "  " << imbalanceStr << endl;
-
-    cout << "\nFlow Toxicity (last " << TOXICITY_WINDOW << " updates):" << endl;
-    cout << "  Buy aggression:  " << fixed << setprecision(4) << buyAggression  << " BTC" << endl;
-    cout << "  Sell aggression: " << fixed << setprecision(4) << sellAggression << " BTC" << endl;
-    cout << "  Ratio: " << fixed << setprecision(4) << aggressionRatio
-         << "  " << toxicityStr << endl;
-
-    cout << "\n----- NEAREST WALLS -----" << endl;
-    if (nearestAskWall.first > 0) {
-        int ticks = (int)round((nearestAskWall.first - midPrice) / TICK_SIZE);
-        cout << "  ASK WALL  $" << fixed << setprecision(2) << nearestAskWall.first
-             << "  |  " << fixed << setprecision(2) << nearestAskWall.second
-             << " BTC  (" << ticks << " ticks away)" << endl;
-    } else {
-        cout << "  ASK WALL  none nearby" << endl;
-    }
-    if (nearestBidWall.first > 0) {
-        int ticks = (int)round((midPrice - nearestBidWall.first) / TICK_SIZE);
-        cout << "  BID WALL  $" << fixed << setprecision(2) << nearestBidWall.first
-             << "  |  " << fixed << setprecision(2) << nearestBidWall.second
-             << " BTC  (" << ticks << " ticks away)" << endl;
-    } else {
-        cout << "  BID WALL  none nearby" << endl;
-    }
-
-    cout << "\n----- LAST ALERTS -----" << endl;
-    if (recentWallEvents.empty()) {
-        cout << "  none yet" << endl;
-    } else {
-        for (auto& e : recentWallEvents) cout << "  " << e << endl;
-    }
-
-    cout << "=================================" << endl;
+    drawUI(midPrice, bestBid, bestAsk, spread, latencyNs, numUpdates,
+           imbalance, buyAggression, sellAggression, aggressionRatio,
+           topAsks, topBids, nearestAskWall, nearestBidWall);
 }
 
 int main() {
     initCSV();
+    initNcurses();
 
     uint64_t freq;
     asm volatile("mrs %0, cntfrq_el0" : "=r"(freq));
 
-    while (true) {  // outer reconnection loop
+    while (true) {
         try {
             net::io_context ioc;
             ssl::context ctx(ssl::context::tlsv12_client);
@@ -346,8 +426,6 @@ int main() {
 
             ws.next_layer().handshake(ssl::stream_base::client);
             ws.handshake(host, target);
-
-            cout << "Connected to Binance..." << endl;
 
             while (true) {
                 beast::flat_buffer buffer;
@@ -376,16 +454,19 @@ int main() {
                 double latencyNs = ticksToNanos(end - start, freq);
 
                 updateToxicityWindow();
-                printOrderBook(latencyNs, numUpdates);
+                renderOrderBook(latencyNs, numUpdates);
             }
         }
         catch (exception const& e) {
+            endwin();
             cerr << "Disconnected: " << e.what() << endl;
             cerr << "Reconnecting in 2 seconds..." << endl;
             this_thread::sleep_for(chrono::seconds(2));
+            initNcurses();
         }
     }
 
+    endwin();
     csvFile.close();
     return 0;
 }
