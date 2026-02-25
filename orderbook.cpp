@@ -1,9 +1,12 @@
 #include <iostream>
+#include <fstream>
 #include <vector>
 #include <string>
 #include <cmath>
 #include <deque>
+#include <thread>
 #include <unordered_map>
+#include <chrono>
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket.hpp>
 #include <boost/beast/ssl.hpp>
@@ -40,17 +43,40 @@ unordered_map<int, double> askWalls;
 vector<string> recentWallEvents;
 
 // ===== TOXICITY TRACKING =====
-// We track aggressive volume (orders hitting the book)
-// vs passive volume (limit orders resting) over last 100 updates
 const int TOXICITY_WINDOW = 100;
-deque<double> aggressiveBuyVol;   // market buys hitting asks
-deque<double> aggressiveSellVol;  // market sells hitting bids
+deque<double> aggressiveBuyVol;
+deque<double> aggressiveSellVol;
 double totalAggressiveBuy  = 0.0;
 double totalAggressiveSell = 0.0;
-
-// Per-update aggressive volume
 double updateAggressiveBuy  = 0.0;
 double updateAggressiveSell = 0.0;
+
+// ===== CSV LOGGING =====
+ofstream csvFile;
+long long updateCount = 0;
+
+void initCSV() {
+    csvFile.open("pulse_data.csv");
+    csvFile << "timestamp_ms,"
+            << "update_count,"
+            << "mid_price,"
+            << "best_bid,"
+            << "best_ask,"
+            << "spread,"
+            << "latency_ns,"
+            << "num_updates,"
+            << "imbalance,"
+            << "buy_aggression,"
+            << "sell_aggression,"
+            << "aggression_ratio,"
+            << "nearest_ask_wall_price,"
+            << "nearest_ask_wall_qty,"
+            << "nearest_bid_wall_price,"
+            << "nearest_bid_wall_qty,"
+            << "wall_event"
+            << "\n";
+    csvFile.flush();
+}
 
 inline int priceToIndex(double price) {
     return (int)round((price - BASE_PRICE) / TICK_SIZE);
@@ -77,19 +103,11 @@ void updateLevel(bool isBid, double price, double qty) {
         if (qty > 0.0 && idx < bestAskIdx) bestAskIdx = idx;
     }
 
-    // Toxicity detection:
-    // If an ask level decreased — someone market-bought, hitting that ask
-    // If a bid level decreased — someone market-sold, hitting that bid
-    if (!isBid && qty < prevQty && prevQty > 0.0) {
-        double consumed = prevQty - qty;
-        updateAggressiveBuy += consumed;  // aggressive buyer hit the ask
-    }
-    if (isBid && qty < prevQty && prevQty > 0.0) {
-        double consumed = prevQty - qty;
-        updateAggressiveSell += consumed; // aggressive seller hit the bid
-    }
+    if (!isBid && qty < prevQty && prevQty > 0.0)
+        updateAggressiveBuy  += prevQty - qty;
+    if (isBid  && qty < prevQty && prevQty > 0.0)
+        updateAggressiveSell += prevQty - qty;
 
-    // Wall detection
     if (qty >= WALL_THRESHOLD && prevQty < WALL_THRESHOLD) {
         walls[idx] = qty;
         string event = "[WALL APPEARED] " + side + " $" +
@@ -110,13 +128,11 @@ void updateLevel(bool isBid, double price, double qty) {
 }
 
 void updateToxicityWindow() {
-    // Add this update's aggressive volume to the rolling window
     aggressiveBuyVol.push_back(updateAggressiveBuy);
     aggressiveSellVol.push_back(updateAggressiveSell);
     totalAggressiveBuy  += updateAggressiveBuy;
     totalAggressiveSell += updateAggressiveSell;
 
-    // Drop oldest if window full
     if ((int)aggressiveBuyVol.size() > TOXICITY_WINDOW) {
         totalAggressiveBuy  -= aggressiveBuyVol.front();
         totalAggressiveSell -= aggressiveSellVol.front();
@@ -124,7 +140,6 @@ void updateToxicityWindow() {
         aggressiveSellVol.pop_front();
     }
 
-    // Reset per-update counters
     updateAggressiveBuy  = 0.0;
     updateAggressiveSell = 0.0;
 }
@@ -139,8 +154,47 @@ double ticksToNanos(uint64_t ticks, uint64_t freq) {
     return (double)ticks * 1e9 / (double)freq;
 }
 
+void logToCSV(double midPrice, double bestBid, double bestAsk,
+              double spread, double latencyNs, int numUpdates,
+              double imbalance, double buyAggression, double sellAggression,
+              double aggressionRatio,
+              double nearestAskWallPrice, double nearestAskWallQty,
+              double nearestBidWallPrice, double nearestBidWallQty) {
+
+    // Timestamp in milliseconds since epoch
+    auto now = chrono::system_clock::now();
+    long long ms = chrono::duration_cast<chrono::milliseconds>(
+        now.time_since_epoch()).count();
+
+    // Latest wall event if any
+    string wallEvent = recentWallEvents.empty() ? "" : recentWallEvents.back();
+    // Escape commas in wall event
+    for (auto& c : wallEvent) if (c == ',') c = ';';
+
+    csvFile << ms << ","
+            << updateCount << ","
+            << fixed << setprecision(2) << midPrice << ","
+            << fixed << setprecision(2) << bestBid  << ","
+            << fixed << setprecision(2) << bestAsk  << ","
+            << fixed << setprecision(2) << spread   << ","
+            << fixed << setprecision(0) << latencyNs << ","
+            << numUpdates << ","
+            << fixed << setprecision(4) << imbalance << ","
+            << fixed << setprecision(4) << buyAggression  << ","
+            << fixed << setprecision(4) << sellAggression << ","
+            << fixed << setprecision(4) << aggressionRatio << ","
+            << fixed << setprecision(2) << nearestAskWallPrice << ","
+            << fixed << setprecision(2) << nearestAskWallQty   << ","
+            << fixed << setprecision(2) << nearestBidWallPrice << ","
+            << fixed << setprecision(2) << nearestBidWallQty   << ","
+            << wallEvent
+            << "\n";
+    csvFile.flush();
+}
+
 void printOrderBook(double latencyNs, int numUpdates) {
     system("clear");
+    updateCount++;
 
     vector<pair<double,double>> topAsks;
     for (int i = bestAskIdx; i < LADDER_SIZE && topAsks.size() < 5; ++i) {
@@ -155,11 +209,10 @@ void printOrderBook(double latencyNs, int numUpdates) {
     double midPrice = (!topBids.empty() && !topAsks.empty())
                       ? (topBids.front().first + topAsks.front().first) / 2.0
                       : 69000.0;
-    double spread   = (!topBids.empty() && !topAsks.empty())
-                      ? topAsks.front().first - topBids.front().first
-                      : 0.0;
+    double bestBid  = !topBids.empty() ? topBids.front().first : 0.0;
+    double bestAsk  = !topAsks.empty() ? topAsks.front().first : 0.0;
+    double spread   = bestAsk - bestBid;
 
-    // Imbalance
     double bidVolume = 0.0, askVolume = 0.0;
     for (auto& b : topBids) bidVolume += b.second;
     for (auto& a : topAsks) askVolume += a.second;
@@ -171,42 +224,40 @@ void printOrderBook(double latencyNs, int numUpdates) {
     else if (imbalance < 0.4) imbalanceStr = "<<<< SELL PRESSURE";
     else                       imbalanceStr = "      NEUTRAL      ";
 
-    // Toxicity
     double totalAggressive = totalAggressiveBuy + totalAggressiveSell;
-    double toxicity = (totalAggressive > 0)
-                      ? totalAggressive / (totalAggressive + 1e-9)
-                      : 0.0;
-
-    // Simpler and more meaningful: buy/sell aggression ratio
-    double buyAggression  = totalAggressiveBuy;
-    double sellAggression = totalAggressiveSell;
+    double buyAggression   = totalAggressiveBuy;
+    double sellAggression  = totalAggressiveSell;
     double aggressionRatio = (totalAggressive > 0)
-                             ? buyAggression / totalAggressive
-                             : 0.5;
+                             ? buyAggression / totalAggressive : 0.5;
 
     string toxicityStr;
     if      (aggressionRatio > 0.65) toxicityStr = "AGGRESSIVE BUYERS";
     else if (aggressionRatio < 0.35) toxicityStr = "AGGRESSIVE SELLERS";
     else                              toxicityStr = "MIXED AGGRESSION";
 
-    // Nearest walls
-    pair<double,double> nearestBidWall = {-1, 0};
-    pair<double,double> nearestAskWall = {-1, 0};
+    pair<double,double> nearestBidWall = {0, 0};
+    pair<double,double> nearestAskWall = {0, 0};
 
     for (auto& w : bidWalls) {
         double wp = indexToPrice(w.first);
         if (abs(wp - midPrice) < WALL_RANGE) {
-            if (nearestBidWall.first < 0 || abs(wp - midPrice) < abs(nearestBidWall.first - midPrice))
+            if (nearestBidWall.first == 0 || abs(wp - midPrice) < abs(nearestBidWall.first - midPrice))
                 nearestBidWall = {wp, w.second};
         }
     }
     for (auto& w : askWalls) {
         double wp = indexToPrice(w.first);
         if (abs(wp - midPrice) < WALL_RANGE) {
-            if (nearestAskWall.first < 0 || abs(wp - midPrice) < abs(nearestAskWall.first - midPrice))
+            if (nearestAskWall.first == 0 || abs(wp - midPrice) < abs(nearestAskWall.first - midPrice))
                 nearestAskWall = {wp, w.second};
         }
     }
+
+    // Log to CSV
+    logToCSV(midPrice, bestBid, bestAsk, spread, latencyNs, numUpdates,
+             imbalance, buyAggression, sellAggression, aggressionRatio,
+             nearestAskWall.first, nearestAskWall.second,
+             nearestBidWall.first, nearestBidWall.second);
 
     // ===== DISPLAY =====
     cout << "============= PULSE =============" << endl;
@@ -214,6 +265,7 @@ void printOrderBook(double latencyNs, int numUpdates) {
     cout << "Spread:   $" << fixed << setprecision(2) << spread   << endl;
     cout << "Latency:   " << fixed << setprecision(0) << latencyNs << " ns" << endl;
     cout << "Updates:   " << numUpdates << endl;
+    cout << "Logged:    " << updateCount << " rows -> pulse_data.csv" << endl;
 
     cout << "\n";
     for (auto it = topAsks.rbegin(); it != topAsks.rend(); ++it) {
@@ -266,69 +318,74 @@ void printOrderBook(double latencyNs, int numUpdates) {
 }
 
 int main() {
-    try {
-        net::io_context ioc;
-        ssl::context ctx(ssl::context::tlsv12_client);
-        ctx.set_default_verify_paths();
+    initCSV();
 
-        tcp::resolver resolver(ioc);
-        websocket::stream<beast::ssl_stream<tcp::socket>> ws(ioc, ctx);
+    uint64_t freq;
+    asm volatile("mrs %0, cntfrq_el0" : "=r"(freq));
 
-        string host = "stream.binance.com";
-        string port = "9443";
-        string target = "/ws/btcusdt@depth";
+    while (true) {  // outer reconnection loop
+        try {
+            net::io_context ioc;
+            ssl::context ctx(ssl::context::tlsv12_client);
+            ctx.set_default_verify_paths();
 
-        auto const results = resolver.resolve(host, port);
-        net::connect(get_lowest_layer(ws), results.begin(), results.end());
+            tcp::resolver resolver(ioc);
+            websocket::stream<beast::ssl_stream<tcp::socket>> ws(ioc, ctx);
 
-        if (!SSL_set_tlsext_host_name(ws.next_layer().native_handle(), host.c_str()))
-            throw beast::system_error(beast::error_code(static_cast<int>(::ERR_get_error()),
-                net::error::get_ssl_category()));
+            string host   = "stream.binance.com";
+            string port   = "9443";
+            string target = "/ws/btcusdt@depth";
 
-        ws.next_layer().handshake(ssl::stream_base::client);
-        ws.handshake(host, target);
+            auto const results = resolver.resolve(host, port);
+            net::connect(get_lowest_layer(ws), results.begin(), results.end());
 
-        cout << "Connected to Binance..." << endl;
+            if (!SSL_set_tlsext_host_name(ws.next_layer().native_handle(), host.c_str()))
+                throw beast::system_error(beast::error_code(
+                    static_cast<int>(::ERR_get_error()),
+                    net::error::get_ssl_category()));
 
-        uint64_t freq;
-        asm volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+            ws.next_layer().handshake(ssl::stream_base::client);
+            ws.handshake(host, target);
 
-        while (true) {
-            beast::flat_buffer buffer;
-            ws.read(buffer);
+            cout << "Connected to Binance..." << endl;
 
-            string msg = beast::buffers_to_string(buffer.data());
-            auto j = json::parse(msg);
+            while (true) {
+                beast::flat_buffer buffer;
+                ws.read(buffer);
 
-            int numUpdates = j["b"].size() + j["a"].size();
+                string msg = beast::buffers_to_string(buffer.data());
+                auto j = json::parse(msg);
 
-            uint64_t start = rdtsc();
+                int numUpdates = j["b"].size() + j["a"].size();
 
-            for (auto& level : j["b"]) {
-                double price = stod(level[0].get<string>());
-                double qty   = stod(level[1].get<string>());
-                updateLevel(true, price, qty);
+                uint64_t start = rdtsc();
+
+                for (auto& level : j["b"]) {
+                    double price = stod(level[0].get<string>());
+                    double qty   = stod(level[1].get<string>());
+                    updateLevel(true, price, qty);
+                }
+
+                for (auto& level : j["a"]) {
+                    double price = stod(level[0].get<string>());
+                    double qty   = stod(level[1].get<string>());
+                    updateLevel(false, price, qty);
+                }
+
+                uint64_t end = rdtsc();
+                double latencyNs = ticksToNanos(end - start, freq);
+
+                updateToxicityWindow();
+                printOrderBook(latencyNs, numUpdates);
             }
-
-            for (auto& level : j["a"]) {
-                double price = stod(level[0].get<string>());
-                double qty   = stod(level[1].get<string>());
-                updateLevel(false, price, qty);
-            }
-
-            uint64_t end = rdtsc();
-            double latencyNs = ticksToNanos(end - start, freq);
-
-            updateToxicityWindow();
-            printOrderBook(latencyNs, numUpdates);
         }
-
-        ws.close(websocket::close_code::normal);
+        catch (exception const& e) {
+            cerr << "Disconnected: " << e.what() << endl;
+            cerr << "Reconnecting in 2 seconds..." << endl;
+            this_thread::sleep_for(chrono::seconds(2));
+        }
     }
-    catch (exception const& e) {
-        cerr << "Error: " << e.what() << endl;
-        return 1;
-    }
 
+    csvFile.close();
     return 0;
 }
