@@ -1,7 +1,7 @@
 #include <iostream>
-#include <map>
 #include <vector>
 #include <string>
+#include <cmath>
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket.hpp>
 #include <boost/beast/ssl.hpp>
@@ -19,8 +19,37 @@ namespace net = boost::asio;
 namespace ssl = boost::asio::ssl;
 using tcp = net::ip::tcp;
 
-map<double, double, greater<double>> bids;
-map<double, double> asks;
+// ===== PRICE LADDER =====
+const double BASE_PRICE  = 44000.0;
+const double TICK_SIZE   = 0.01;
+const int    LADDER_SIZE = 5000000;
+
+vector<double> bidLadder(LADDER_SIZE, 0.0);
+vector<double> askLadder(LADDER_SIZE, 0.0);
+
+int bestBidIdx = 0;
+int bestAskIdx = LADDER_SIZE - 1;
+
+inline int priceToIndex(double price) {
+    return (int)round((price - BASE_PRICE) / TICK_SIZE);
+}
+
+inline double indexToPrice(int idx) {
+    return BASE_PRICE + idx * TICK_SIZE;
+}
+
+void updateLevel(bool isBid, double price, double qty) {
+    int idx = priceToIndex(price);
+    if (idx < 0 || idx >= LADDER_SIZE) return;
+
+    if (isBid) {
+        bidLadder[idx] = qty;
+        if (qty > 0.0 && idx > bestBidIdx) bestBidIdx = idx;
+    } else {
+        askLadder[idx] = qty;
+        if (qty > 0.0 && idx < bestAskIdx) bestAskIdx = idx;
+    }
+}
 
 uint64_t rdtsc() {
     uint64_t val;
@@ -32,49 +61,61 @@ double ticksToNanos(uint64_t ticks, uint64_t freq) {
     return (double)ticks * 1e9 / (double)freq;
 }
 
-void updateLevel(bool isBid, double price, double qty) {
-    if (isBid) {
-        if (qty == 0.0) bids.erase(price);
-        else bids[price] = qty;
-    } else {
-        if (qty == 0.0) asks.erase(price);
-        else asks[price] = qty;
-    }
-}
-
 void printOrderBook(double latencyNs, int numUpdates) {
     system("clear");
     cout << "===== LIVE BTC/USDT ORDER BOOK =====" << endl;
     cout << "Update latency:  " << fixed << setprecision(2) << latencyNs << " ns" << endl;
     cout << "Levels updated:  " << numUpdates << endl;
 
-    // Collect top 5 asks
     vector<pair<double,double>> topAsks;
-    for (auto it = asks.begin(); it != asks.end() && topAsks.size() < 5; ++it) {
-        topAsks.push_back(*it);
+    for (int i = bestAskIdx; i < LADDER_SIZE && topAsks.size() < 5; ++i) {
+        if (askLadder[i] > 0.0) topAsks.push_back({indexToPrice(i), askLadder[i]});
+    }
+
+    vector<pair<double,double>> topBids;
+    for (int i = bestBidIdx; i >= 0 && topBids.size() < 5; --i) {
+        if (bidLadder[i] > 0.0) topBids.push_back({indexToPrice(i), bidLadder[i]});
     }
 
     cout << "\n";
-    // Print asks in reverse so lowest ask is closest to spread
     for (auto it = topAsks.rbegin(); it != topAsks.rend(); ++it) {
         cout << "  $" << fixed << setprecision(2) << it->first
              << "  |  " << fixed << setprecision(6) << it->second
              << " BTC  <-- SELL" << endl;
     }
 
-    // Spread
-    if (!bids.empty() && !asks.empty()) {
-        double spread = asks.begin()->first - bids.begin()->first;
+    if (!topBids.empty() && !topAsks.empty()) {
+        double spread = topAsks.front().first - topBids.front().first;
         cout << "  -------- SPREAD: $" << fixed << setprecision(2) << spread << " --------" << endl;
     }
 
-    // Print top 5 bids
-    int count = 0;
-    for (auto it = bids.begin(); it != bids.end() && count < 5; ++it, ++count) {
-        cout << "  $" << fixed << setprecision(2) << it->first
-             << "  |  " << fixed << setprecision(6) << it->second
+    for (auto& b : topBids) {
+        cout << "  $" << fixed << setprecision(2) << b.first
+             << "  |  " << fixed << setprecision(6) << b.second
              << " BTC  <-- BUY" << endl;
     }
+
+    // ===== ORDER BOOK IMBALANCE =====
+    double bidVolume = 0.0;
+    double askVolume = 0.0;
+
+    for (auto& b : topBids) bidVolume += b.second;
+    for (auto& a : topAsks) askVolume += a.second;
+
+    double imbalance = bidVolume / (bidVolume + askVolume);
+
+    cout << "\nImbalance: " << fixed << setprecision(4) << imbalance;
+
+    if (imbalance > 0.6)
+        cout << "  <<< BUY PRESSURE";
+    else if (imbalance < 0.4)
+        cout << "  <<< SELL PRESSURE";
+    else
+        cout << "  <<< NEUTRAL";
+
+    cout << endl;
+    cout << "Bid Vol: " << fixed << setprecision(6) << bidVolume
+         << " BTC  |  Ask Vol: " << askVolume << " BTC" << endl;
 
     cout << "\n====================================" << endl;
 }
